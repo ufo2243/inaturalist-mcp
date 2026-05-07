@@ -108,12 +108,66 @@ const paginationSchema = {
     .describe("Results per page, capped at 50. Defaults to iNaturalist's API default."),
 };
 
+const taxonRankSchema = z.enum([
+  "kingdom",
+  "phylum",
+  "class",
+  "order",
+  "family",
+  "genus",
+  "species",
+  "subspecies",
+]);
+
+const observationFilterSchema = {
+  q: z.string().optional().describe("Free-text observation search query."),
+  taxon_id: z.number().int().positive().optional().describe("iNaturalist taxon ID."),
+  taxon_name: z.string().optional().describe("Scientific or common taxon name."),
+  iconic_taxa: z
+    .string()
+    .optional()
+    .describe("Comma-separated iconic taxa, e.g. Aves,Mammalia,Plantae,Arachnida."),
+  place_id: z.union([z.number().int().positive(), z.string()]).optional().describe("iNaturalist place ID or slug."),
+  project_id: z.string().optional().describe("iNaturalist project ID or slug."),
+  user_id: z.string().optional().describe("iNaturalist username or user ID."),
+  user_login: z.string().optional().describe("iNaturalist username."),
+  lat: z.number().min(-90).max(90).optional().describe("Latitude for radius search."),
+  lng: z.number().min(-180).max(180).optional().describe("Longitude for radius search."),
+  radius: z.number().positive().optional().describe("Radius in kilometers when lat/lng are provided."),
+  nelat: z.number().min(-90).max(90).optional().describe("Northeast latitude for bounding-box search."),
+  nelng: z.number().min(-180).max(180).optional().describe("Northeast longitude for bounding-box search."),
+  swlat: z.number().min(-90).max(90).optional().describe("Southwest latitude for bounding-box search."),
+  swlng: z.number().min(-180).max(180).optional().describe("Southwest longitude for bounding-box search."),
+  d1: z.string().optional().describe("Observed date lower bound, YYYY-MM-DD."),
+  d2: z.string().optional().describe("Observed date upper bound, YYYY-MM-DD."),
+  observed_on: z.string().optional().describe("Exact observed date, YYYY-MM-DD."),
+  created_d1: z.string().optional().describe("Created date lower bound, YYYY-MM-DD."),
+  created_d2: z.string().optional().describe("Created date upper bound, YYYY-MM-DD."),
+  updated_since: z.string().optional().describe("Only observations updated since this ISO timestamp or date."),
+  quality_grade: z
+    .enum(["casual", "needs_id", "research"])
+    .optional()
+    .describe("Observation quality grade."),
+  verifiable: z.boolean().optional().describe("Observations with needs_id or research quality grade."),
+  photos: z.boolean().optional().describe("Only observations with photos."),
+  sounds: z.boolean().optional().describe("Only observations with sounds."),
+  captive: z.boolean().optional().describe("Captive or cultivated observations."),
+  identified: z.boolean().optional().describe("Observations that have community identifications."),
+  geo: z.boolean().optional().describe("Observations with coordinates."),
+  mappable: z.boolean().optional().describe("Observations that can be shown on maps."),
+  hrank: taxonRankSchema.optional().describe("Taxon must have this rank or lower."),
+  lrank: taxonRankSchema.optional().describe("Taxon must have this rank or higher."),
+  search_on: z.enum(["names", "tags", "description", "place"]).optional().describe("Field to search when using q."),
+  locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
+  preferred_place_id: z.number().int().positive().optional().describe("Place preference for regional common names."),
+};
+
 type TransportMode = "stdio" | "http";
 
 function createServer(): McpServer {
   const server = new McpServer({
     name: "inaturalist-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   server.registerTool(
@@ -121,22 +175,9 @@ function createServer(): McpServer {
     {
       description: "Search public iNaturalist observations by taxon, place, user, date, location, or free text.",
       inputSchema: {
-        q: z.string().optional().describe("Free-text search query."),
-        taxon_id: z.number().int().positive().optional().describe("iNaturalist taxon ID."),
-        place_id: z.number().int().positive().optional().describe("iNaturalist place ID."),
-        user_id: z.string().optional().describe("iNaturalist username or user ID."),
-        lat: z.number().min(-90).max(90).optional().describe("Latitude for geo search."),
-        lng: z.number().min(-180).max(180).optional().describe("Longitude for geo search."),
-        radius: z.number().positive().optional().describe("Radius in kilometers when lat/lng are provided."),
-        d1: z.string().optional().describe("Observed date lower bound, YYYY-MM-DD."),
-        d2: z.string().optional().describe("Observed date upper bound, YYYY-MM-DD."),
-        observed_on: z.string().optional().describe("Exact observed date, YYYY-MM-DD."),
-        quality_grade: z
-          .enum(["casual", "needs_id", "research"])
-          .optional()
-          .describe("Observation quality grade."),
+        ...observationFilterSchema,
         order_by: z
-          .enum(["created_at", "observed_on", "species_guess", "votes", "id"])
+          .enum(["created_at", "geo_score", "id", "observed_on", "random", "species_guess", "updated_at", "votes"])
           .optional()
           .describe("Sort field."),
         order: z.enum(["asc", "desc"]).optional().describe("Sort direction."),
@@ -175,10 +216,7 @@ function createServer(): McpServer {
       description: "Search iNaturalist taxa by name, common name, rank, or iconic taxon.",
       inputSchema: {
         q: z.string().optional().describe("Taxon name or common name query."),
-        rank: z
-          .enum(["kingdom", "phylum", "class", "order", "family", "genus", "species", "subspecies"])
-          .optional()
-          .describe("Taxonomic rank filter."),
+        rank: taxonRankSchema.optional().describe("Taxonomic rank filter."),
         iconic_taxa: z
           .string()
           .optional()
@@ -219,21 +257,219 @@ function createServer(): McpServer {
     {
       description: "Get species counts from public iNaturalist observations for a place, taxon, user, date range, or location.",
       inputSchema: {
-        taxon_id: z.number().int().positive().optional().describe("iNaturalist taxon ID."),
-        place_id: z.number().int().positive().optional().describe("iNaturalist place ID."),
-        user_id: z.string().optional().describe("iNaturalist username or user ID."),
-        lat: z.number().min(-90).max(90).optional().describe("Latitude for geo search."),
-        lng: z.number().min(-180).max(180).optional().describe("Longitude for geo search."),
-        radius: z.number().positive().optional().describe("Radius in kilometers when lat/lng are provided."),
-        d1: z.string().optional().describe("Observed date lower bound, YYYY-MM-DD."),
-        d2: z.string().optional().describe("Observed date upper bound, YYYY-MM-DD."),
-        locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
+        ...observationFilterSchema,
         ...paginationSchema,
       },
     },
     async (args) => {
       try {
         return toolResult(await getJson("observations/species_counts", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_places",
+    {
+      description: "Autocomplete iNaturalist places by name.",
+      inputSchema: {
+        q: z.string().describe("Place name query, e.g. Shanghai."),
+        order_by: z.enum(["area"]).optional().describe("Sort places by area."),
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("places/autocomplete", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_place",
+    {
+      description: "Get one iNaturalist place by ID or slug.",
+      inputSchema: {
+        id: z.union([z.number().int().positive(), z.string()]).describe("iNaturalist place ID or slug."),
+        admin_level: z
+          .string()
+          .optional()
+          .describe("Optional comma-separated admin levels, e.g. 0,10,20."),
+      },
+    },
+    async ({ id, admin_level }) => {
+      try {
+        return toolResult(await getJson(`places/${id}`, { admin_level }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_projects",
+    {
+      description: "Search iNaturalist projects by name, place, location, type, or member.",
+      inputSchema: {
+        q: z.string().optional().describe("Project name query."),
+        id: z.string().optional().describe("Project ID or slug."),
+        not_id: z.string().optional().describe("Exclude project ID or slug."),
+        lat: z.number().min(-90).max(90).optional().describe("Latitude for location search."),
+        lng: z.number().min(-180).max(180).optional().describe("Longitude for location search."),
+        radius: z.number().positive().optional().describe("Radius in kilometers when lat/lng are provided."),
+        place_id: z.string().optional().describe("Associated place ID or slug."),
+        featured: z.boolean().optional().describe("Only featured projects."),
+        noteworthy: z.boolean().optional().describe("Only noteworthy projects."),
+        type: z.enum(["collection", "umbrella"]).optional().describe("Project type."),
+        member_id: z.string().optional().describe("Only projects with this member user ID or username."),
+        order_by: z
+          .enum(["recent_posts", "created", "updated", "distance", "featured"])
+          .optional()
+          .describe("Sort field."),
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("projects", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_project",
+    {
+      description: "Get one iNaturalist project by ID or slug.",
+      inputSchema: {
+        id: z.union([z.number().int().positive(), z.string()]).describe("iNaturalist project ID or slug."),
+        rule_details: z.boolean().optional().describe("Include project rule details."),
+      },
+    },
+    async ({ id, rule_details }) => {
+      try {
+        return toolResult(await getJson(`projects/${id}`, { rule_details }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_users",
+    {
+      description: "Autocomplete iNaturalist users by username or name.",
+      inputSchema: {
+        q: z.string().describe("Username or name query."),
+        project_id: z.string().optional().describe("Limit to users associated with this project ID or slug."),
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("users/autocomplete", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_user",
+    {
+      description: "Get one iNaturalist user by ID or username.",
+      inputSchema: {
+        id: z.union([z.number().int().positive(), z.string()]).describe("iNaturalist user ID or username."),
+      },
+    },
+    async ({ id }) => {
+      try {
+        return toolResult(await getJson(`users/${id}`));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search",
+    {
+      description: "Universal iNaturalist search across places, projects, taxa, and users.",
+      inputSchema: {
+        q: z.string().optional().describe("Search query."),
+        sources: z
+          .string()
+          .optional()
+          .describe("Comma-separated sources: places,projects,taxa,users."),
+        place_id: z.string().optional().describe("Associated place ID or slug."),
+        include_taxon_ancestors: z.boolean().optional().describe("Include taxon ancestors in taxon search results."),
+        locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
+        preferred_place_id: z.number().int().positive().optional().describe("Place preference for regional common names."),
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("search", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_observation_histogram",
+    {
+      description: "Get a date/time histogram for public iNaturalist observations matching filters.",
+      inputSchema: {
+        ...observationFilterSchema,
+        date_field: z.enum(["observed", "created"]).optional().describe("Date field to histogram."),
+        interval: z.enum(["hour", "day", "week", "month", "year"]).optional().describe("Histogram interval."),
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("observations/histogram", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_observation_observers",
+    {
+      description: "Get top observers for public iNaturalist observations matching filters.",
+      inputSchema: {
+        ...observationFilterSchema,
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("observations/observers", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_observation_identifiers",
+    {
+      description: "Get top identifiers for public iNaturalist observations matching filters.",
+      inputSchema: {
+        ...observationFilterSchema,
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("observations/identifiers", args));
       } catch (error) {
         return errorResult(error);
       }
