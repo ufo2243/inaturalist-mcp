@@ -9,7 +9,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 
 const API_BASE_URL = "https://api.inaturalist.org/v1";
-const USER_AGENT = "inaturalist-mcp/1.0 (https://github.com/ufo2243/inaturalist-mcp)";
+const USER_AGENT = "inaturalist-mcp/1.2 (https://github.com/ufo2243/inaturalist-mcp)";
 
 type QueryValue = string | number | boolean | undefined | null;
 type QueryParams = Record<string, QueryValue | QueryValue[]>;
@@ -76,6 +76,49 @@ function toolResult(data: unknown) {
     ],
     structuredContent: data as Record<string, unknown>,
   };
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+
+  return {};
+}
+
+function resultsOf(value: unknown): unknown[] {
+  const results = asRecord(value).results;
+  return Array.isArray(results) ? results : [];
+}
+
+function countByIconicTaxon(items: unknown[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+
+  for (const item of items) {
+    const itemRecord = asRecord(item);
+    const taxon = asRecord(itemRecord.taxon);
+    const iconicTaxonName = typeof taxon.iconic_taxon_name === "string" ? taxon.iconic_taxon_name : "unknown";
+    const count = typeof itemRecord.count === "number" ? itemRecord.count : 0;
+    counts[iconicTaxonName] = (counts[iconicTaxonName] ?? 0) + count;
+  }
+
+  return counts;
+}
+
+function summarizeSpeciesCounts(data: unknown) {
+  return resultsOf(data).map((item) => {
+    const itemRecord = asRecord(item);
+    const taxon = asRecord(itemRecord.taxon);
+
+    return {
+      count: itemRecord.count,
+      taxon_id: taxon.id,
+      name: taxon.name,
+      common_name: taxon.preferred_common_name,
+      rank: taxon.rank,
+      iconic_taxon_name: taxon.iconic_taxon_name,
+    };
+  });
 }
 
 function errorResult(error: unknown) {
@@ -162,12 +205,48 @@ const observationFilterSchema = {
   preferred_place_id: z.number().int().positive().optional().describe("Place preference for regional common names."),
 };
 
+const identificationFilterSchema = {
+  id: z.string().optional().describe("Comma-separated identification IDs."),
+  user_id: z.string().optional().describe("Identifier user ID."),
+  user_login: z.string().optional().describe("Identifier username."),
+  taxon_id: z.string().optional().describe("Identification taxon ID, or comma-separated taxon IDs."),
+  observation_taxon_id: z.string().optional().describe("Observation taxon ID, or comma-separated taxon IDs."),
+  place_id: z.string().optional().describe("Observation place ID, or comma-separated place IDs."),
+  category: z
+    .enum(["improving", "supporting", "leading", "maverick"])
+    .optional()
+    .describe("Identification category."),
+  quality_grade: z.enum(["casual", "needs_id", "research"]).optional().describe("Observation quality grade."),
+  current: z.union([z.boolean(), z.literal("any")]).optional().describe("Most recent ID on an observation by a user."),
+  current_taxon: z.boolean().optional().describe("Identification taxon matches the observation taxon."),
+  own_observation: z.boolean().optional().describe("Identification was added by the observer."),
+  is_change: z.boolean().optional().describe("Identification was created as a result of a taxon change."),
+  taxon_active: z.boolean().optional().describe("Identification taxon is currently active."),
+  observation_taxon_active: z.boolean().optional().describe("Observation taxon is currently active."),
+  iconic_taxon_id: z.string().optional().describe("Identification iconic taxon ID, or comma-separated IDs."),
+  observation_iconic_taxon_id: z.string().optional().describe("Observation iconic taxon ID, or comma-separated IDs."),
+  rank: z.string().optional().describe("Identification taxon rank."),
+  observation_rank: z.string().optional().describe("Observation taxon rank."),
+  lrank: z.string().optional().describe("Identification taxon must have this rank or higher."),
+  hrank: z.string().optional().describe("Identification taxon must have this rank or lower."),
+  observation_lrank: z.string().optional().describe("Observation taxon must have this rank or higher."),
+  observation_hrank: z.string().optional().describe("Observation taxon must have this rank or lower."),
+  without_taxon_id: z.string().optional().describe("Exclude identifications of these taxa and descendants."),
+  without_observation_taxon_id: z.string().optional().describe("Exclude observations of these taxa and descendants."),
+  d1: z.string().optional().describe("Identification created on or after this date/time."),
+  d2: z.string().optional().describe("Identification created on or before this date/time."),
+  observed_d1: z.string().optional().describe("Observation observed on or after this date."),
+  observed_d2: z.string().optional().describe("Observation observed on or before this date."),
+  observation_created_d1: z.string().optional().describe("Observation created on or after this date."),
+  observation_created_d2: z.string().optional().describe("Observation created on or before this date."),
+};
+
 type TransportMode = "stdio" | "http";
 
 function createServer(): McpServer {
   const server = new McpServer({
     name: "inaturalist-mcp",
-    version: "1.1.0",
+    version: "1.2.0",
   });
 
   server.registerTool(
@@ -470,6 +549,345 @@ function createServer(): McpServer {
     async (args) => {
       try {
         return toolResult(await getJson("observations/identifiers", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_observation_popular_field_values",
+    {
+      description: "Get popular observation field values for public observations matching filters.",
+      inputSchema: {
+        ...observationFilterSchema,
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("observations/popular_field_values", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_identifications",
+    {
+      description: "Search public iNaturalist identifications by identifier, taxon, observation taxon, place, date, or category.",
+      inputSchema: {
+        ...identificationFilterSchema,
+        order_by: z.enum(["created_at", "id"]).optional().describe("Sort field."),
+        order: z.enum(["asc", "desc"]).optional().describe("Sort direction."),
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("identifications", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_identification",
+    {
+      description: "Get one or more public iNaturalist identifications by ID.",
+      inputSchema: {
+        id: z.string().describe("Identification ID, or comma-separated IDs."),
+      },
+    },
+    async ({ id }) => {
+      try {
+        return toolResult(await getJson(`identifications/${id}`));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_identification_species_counts",
+    {
+      description: "Get species counts from public iNaturalist identifications matching filters.",
+      inputSchema: {
+        ...identificationFilterSchema,
+        taxon_of: z
+          .enum(["identification", "observation"])
+          .optional()
+          .describe("Whether to count identification taxa or observation taxa."),
+        order: z.enum(["asc", "desc"]).optional().describe("Sort direction."),
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("identifications/species_counts", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_identification_identifiers",
+    {
+      description: "Get top identifiers from public iNaturalist identifications matching filters.",
+      inputSchema: {
+        ...identificationFilterSchema,
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("identifications/identifiers", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_identification_observers",
+    {
+      description: "Get top observers from public iNaturalist identifications matching filters.",
+      inputSchema: {
+        ...identificationFilterSchema,
+        ...paginationSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("identifications/observers", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_places_nearby",
+    {
+      description: "Find iNaturalist places intersecting a bounding box.",
+      inputSchema: {
+        nelat: z.number().min(-90).max(90).describe("Northeast latitude."),
+        nelng: z.number().min(-180).max(180).describe("Northeast longitude."),
+        swlat: z.number().min(-90).max(90).describe("Southwest latitude."),
+        swlng: z.number().min(-180).max(180).describe("Southwest longitude."),
+        name: z.string().optional().describe("Optional place name filter."),
+        per_page: paginationSchema.per_page,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("places/nearby", args));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_project_members",
+    {
+      description: "Get members of an iNaturalist project by project ID.",
+      inputSchema: {
+        id: z.number().int().positive().describe("iNaturalist project ID."),
+        role: z.enum(["curator", "manager"]).optional().describe("Membership role filter."),
+        skip_counts: z.boolean().optional().describe("Skip expensive count fields when supported by the API."),
+        ...paginationSchema,
+      },
+    },
+    async ({ id, role, skip_counts, page, per_page }) => {
+      try {
+        return toolResult(await getJson(`projects/${id}/members`, { role, skip_counts, page, per_page }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_user_projects",
+    {
+      description: "Get projects associated with an iNaturalist user by user ID or username.",
+      inputSchema: {
+        id: z.union([z.number().int().positive(), z.string()]).describe("iNaturalist user ID or username."),
+        rule_details: z.boolean().optional().describe("Include project rule details."),
+        project_type: z.enum(["collection", "umbrella"]).optional().describe("Project type filter."),
+        ...paginationSchema,
+      },
+    },
+    async ({ id, rule_details, project_type, page, per_page }) => {
+      try {
+        return toolResult(await getJson(`users/${id}/projects`, { rule_details, project_type, page, per_page }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_controlled_terms",
+    {
+      description: "Get iNaturalist controlled terms used for annotations.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        return toolResult(await getJson("controlled_terms"));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_controlled_terms_for_taxon",
+    {
+      description: "Get annotation controlled terms applicable to a taxon.",
+      inputSchema: {
+        taxon_id: z.number().int().positive().describe("iNaturalist taxon ID."),
+      },
+    },
+    async ({ taxon_id }) => {
+      try {
+        return toolResult(await getJson("controlled_terms/for_taxon", { taxon_id }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_recent_species_nearby",
+    {
+      description: "Convenience tool: get recent species counts near a latitude/longitude using public observations.",
+      inputSchema: {
+        lat: z.number().min(-90).max(90).describe("Latitude."),
+        lng: z.number().min(-180).max(180).describe("Longitude."),
+        radius: z.number().positive().default(10).describe("Radius in kilometers."),
+        iconic_taxa: z.string().optional().describe("Comma-separated iconic taxa, e.g. Aves,Plantae."),
+        d1: z.string().optional().describe("Observed date lower bound, YYYY-MM-DD."),
+        d2: z.string().optional().describe("Observed date upper bound, YYYY-MM-DD."),
+        quality_grade: z.enum(["casual", "needs_id", "research"]).optional().describe("Observation quality grade."),
+        locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
+        per_page: paginationSchema.per_page,
+      },
+    },
+    async (args) => {
+      try {
+        const speciesCounts = await getJson("observations/species_counts", args);
+        return toolResult({
+          query: args,
+          summary: {
+            species_taxa_returned: resultsOf(speciesCounts).length,
+            total_species_taxa_matching: asRecord(speciesCounts).total_results,
+          },
+          top_species: summarizeSpeciesCounts(speciesCounts),
+          raw: speciesCounts,
+        });
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_user_species_summary",
+    {
+      description: "Convenience tool: summarize a user's observed species from public observations.",
+      inputSchema: {
+        user_id: z.string().describe("iNaturalist username or user ID."),
+        iconic_taxa: z.string().optional().describe("Comma-separated iconic taxa, e.g. Aves,Plantae."),
+        d1: z.string().optional().describe("Observed date lower bound, YYYY-MM-DD."),
+        d2: z.string().optional().describe("Observed date upper bound, YYYY-MM-DD."),
+        quality_grade: z.enum(["casual", "needs_id", "research"]).optional().describe("Observation quality grade."),
+        locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
+        per_page: paginationSchema.per_page,
+      },
+    },
+    async (args) => {
+      try {
+        const [observations, speciesCounts] = await Promise.all([
+          getJson("observations", { ...args, per_page: 1 }),
+          getJson("observations/species_counts", args),
+        ]);
+        const topSpecies = summarizeSpeciesCounts(speciesCounts);
+
+        return toolResult({
+          query: args,
+          summary: {
+            total_observations: asRecord(observations).total_results,
+            total_species_taxa_matching: asRecord(speciesCounts).total_results,
+            species_taxa_returned: topSpecies.length,
+            counts_by_iconic_taxon_in_returned_species: countByIconicTaxon(resultsOf(speciesCounts)),
+          },
+          top_species: topSpecies,
+          raw: {
+            observations,
+            species_counts: speciesCounts,
+          },
+        });
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "find_place_observations",
+    {
+      description: "Convenience tool: find a place by name, then search public observations in the best-matching place.",
+      inputSchema: {
+        q: z.string().describe("Place name query, e.g. Shanghai."),
+        iconic_taxa: z.string().optional().describe("Comma-separated iconic taxa, e.g. Aves,Plantae."),
+        taxon_id: z.number().int().positive().optional().describe("iNaturalist taxon ID."),
+        taxon_name: z.string().optional().describe("Scientific or common taxon name."),
+        d1: z.string().optional().describe("Observed date lower bound, YYYY-MM-DD."),
+        d2: z.string().optional().describe("Observed date upper bound, YYYY-MM-DD."),
+        quality_grade: z.enum(["casual", "needs_id", "research"]).optional().describe("Observation quality grade."),
+        order_by: z
+          .enum(["created_at", "geo_score", "id", "observed_on", "random", "species_guess", "updated_at", "votes"])
+          .optional()
+          .describe("Observation sort field."),
+        order: z.enum(["asc", "desc"]).optional().describe("Observation sort direction."),
+        locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
+        per_page: paginationSchema.per_page,
+      },
+    },
+    async ({ q, ...observationArgs }) => {
+      try {
+        const places = await getJson("places/autocomplete", { q, per_page: 1 });
+        const selectedPlace = resultsOf(places)[0];
+        const selectedPlaceRecord = asRecord(selectedPlace);
+
+        if (!selectedPlaceRecord.id) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: `No iNaturalist place matched "${q}".`,
+              },
+            ],
+          };
+        }
+
+        const observations = await getJson("observations", {
+          ...observationArgs,
+          place_id: String(selectedPlaceRecord.id),
+        });
+
+        return toolResult({
+          place_query: q,
+          selected_place: selectedPlace,
+          observations,
+        });
       } catch (error) {
         return errorResult(error);
       }

@@ -26,6 +26,9 @@ After adding the config, restart or reload your MCP client.
 ## Main Tools
 
 - `search_observations`: Search public observations by taxon, place, user, date, location, or text.
+- `get_recent_species_nearby`: Get nearby species counts from public observations.
+- `get_user_species_summary`: Summarize a user's observed species.
+- `find_place_observations`: Find a place by name, then search observations there.
 - `search_taxa`: Search taxa by scientific name, common name, rank, or iconic taxon.
 - `search_places`: Autocomplete places by name.
 - `search_users`: Autocomplete users by username or name.
@@ -40,7 +43,14 @@ After adding the config, restart or reload your MCP client.
 - Find observations of `Misumena vatia` from the last year.
 - What plants have been observed near latitude `31.2304`, longitude `121.4737` within 10 km?
 - Find iNaturalist places matching Shanghai, then use the best place ID for observation searches.
+- Find the best matching iNaturalist place for Shanghai and show recent bird observations there.
+- Summarize the top species observed by user `misumena2243`.
+- What species have been observed near latitude `31.2304`, longitude `121.4737` within 10 km?
 - Search iNaturalist projects about urban biodiversity.
+- Which iNaturalist places are near this bounding box?
+- What annotation terms apply to birds?
+- What are the most common observation field values for this project?
+- Show recent identifications for spiders in a place.
 - Who are the top observers of birds in Shanghai?
 - Show a monthly histogram of research-grade observations in China this year.
 - Get details for iNaturalist observation `358826279`.
@@ -66,6 +76,20 @@ After adding the config, restart or reload your MCP client.
 - `get_observation_histogram`: Fetch observation histograms by date/time interval.
 - `get_observation_observers`: Fetch top observers for matching observations.
 - `get_observation_identifiers`: Fetch top identifiers for matching observations.
+- `get_observation_popular_field_values`: Fetch popular observation field values for matching observations.
+- `search_identifications`: Search public identifications by identifier, taxon, place, date, or category.
+- `get_identification`: Fetch one or more identifications by ID.
+- `get_identification_species_counts`: Fetch species counts from matching identifications.
+- `get_identification_identifiers`: Fetch top identifiers from matching identifications.
+- `get_identification_observers`: Fetch top observers from matching identifications.
+- `get_places_nearby`: Fetch places intersecting a bounding box.
+- `get_project_members`: Fetch project members by project ID.
+- `get_user_projects`: Fetch projects associated with a user.
+- `get_controlled_terms`: Fetch annotation controlled terms.
+- `get_controlled_terms_for_taxon`: Fetch annotation controlled terms applicable to a taxon.
+- `get_recent_species_nearby`: Convenience wrapper for nearby species counts.
+- `get_user_species_summary`: Convenience summary of a user's observed species.
+- `find_place_observations`: Convenience wrapper that finds a place then searches observations there.
 
 </details>
 
