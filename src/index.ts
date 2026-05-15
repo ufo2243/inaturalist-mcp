@@ -8,11 +8,23 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 
-const API_BASE_URL = "https://api.inaturalist.org/v1";
-const USER_AGENT = "inaturalist-mcp/1.2 (https://github.com/ufo2243/inaturalist-mcp)";
+const SERVER_VERSION = "1.3.0";
+const API_BASE_URLS = {
+  v1: "https://api.inaturalist.org/v1",
+  v2: "https://api.inaturalist.org/v2",
+} as const;
+const USER_AGENT = `inaturalist-mcp/${SERVER_VERSION} (https://github.com/ufo2243/inaturalist-mcp)`;
 
+type ApiVersion = keyof typeof API_BASE_URLS;
 type QueryValue = string | number | boolean | undefined | null;
 type QueryParams = Record<string, QueryValue | QueryValue[]>;
+type GetJsonOptions = {
+  apiVersion?: ApiVersion;
+  defaultFields?: boolean | string;
+};
+
+const COMPACT_TAXON_COUNT_FIELDS =
+  "count,taxon.id,taxon.name,taxon.preferred_common_name,taxon.rank,taxon.iconic_taxon_name,taxon.observations_count,taxon.default_photo";
 
 class INaturalistApiError extends Error {
   constructor(
@@ -24,8 +36,8 @@ class INaturalistApiError extends Error {
   }
 }
 
-function buildUrl(path: string, params: QueryParams = {}): URL {
-  const url = new URL(`${API_BASE_URL}/${path.replace(/^\/+/, "")}`);
+function buildUrl(path: string, params: QueryParams = {}, apiVersion: ApiVersion = "v2"): URL {
+  const url = new URL(`${API_BASE_URLS[apiVersion]}/${path.replace(/^\/+/, "")}`);
 
   for (const [key, value] of Object.entries(params)) {
     if (Array.isArray(value)) {
@@ -45,8 +57,19 @@ function buildUrl(path: string, params: QueryParams = {}): URL {
   return url;
 }
 
-async function getJson(path: string, params: QueryParams = {}): Promise<unknown> {
-  const url = buildUrl(path, params);
+async function getJson(path: string, params: QueryParams = {}, options: GetJsonOptions = {}): Promise<unknown> {
+  const apiVersion = options.apiVersion ?? "v2";
+  const requestParams = { ...params };
+
+  if (
+    apiVersion === "v2" &&
+    options.defaultFields &&
+    (requestParams.fields === undefined || requestParams.fields === null || requestParams.fields === "")
+  ) {
+    requestParams.fields = typeof options.defaultFields === "string" ? options.defaultFields : "all";
+  }
+
+  const url = buildUrl(path, requestParams, apiVersion);
   const response = await fetch(url, {
     headers: {
       Accept: "application/json",
@@ -89,6 +112,34 @@ function asRecord(value: unknown): Record<string, unknown> {
 function resultsOf(value: unknown): unknown[] {
   const results = asRecord(value).results;
   return Array.isArray(results) ? results : [];
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+async function resolveObservationUuid(id: number | string): Promise<string> {
+  if (typeof id === "string" && isUuid(id)) {
+    return id;
+  }
+
+  const observations = await getJson(
+    "observations",
+    {
+      id,
+      per_page: 1,
+      fields: "id,uuid",
+    },
+    { apiVersion: "v2" },
+  );
+  const firstObservation = asRecord(resultsOf(observations)[0]);
+  const uuid = firstObservation.uuid;
+
+  if (typeof uuid !== "string") {
+    throw new Error(`No iNaturalist observation matched "${id}".`);
+  }
+
+  return uuid;
 }
 
 function countByIconicTaxon(items: unknown[]): Record<string, number> {
@@ -151,6 +202,17 @@ const paginationSchema = {
     .describe("Results per page, capped at 50. Defaults to iNaturalist's API default."),
 };
 
+const fieldsSchema = {
+  fields: z
+    .string()
+    .optional()
+    .describe('iNaturalist API v2 response fields, e.g. "id,uuid,name" or "all". Defaults to "all" for v2 tools.'),
+};
+
+const observationIdSchema = z
+  .union([z.number().int().positive(), z.string()])
+  .describe("iNaturalist observation numeric ID or v2 UUID.");
+
 const taxonRankSchema = z.enum([
   "kingdom",
   "phylum",
@@ -163,6 +225,8 @@ const taxonRankSchema = z.enum([
 ]);
 
 const observationFilterSchema = {
+  id: z.string().optional().describe("Observation ID, or comma-separated observation IDs."),
+  not_id: z.string().optional().describe("Observation ID, or comma-separated observation IDs, to exclude."),
   q: z.string().optional().describe("Free-text observation search query."),
   taxon_id: z.number().int().positive().optional().describe("iNaturalist taxon ID."),
   taxon_name: z.string().optional().describe("Scientific or common taxon name."),
@@ -187,6 +251,8 @@ const observationFilterSchema = {
   created_d1: z.string().optional().describe("Created date lower bound, YYYY-MM-DD."),
   created_d2: z.string().optional().describe("Created date upper bound, YYYY-MM-DD."),
   updated_since: z.string().optional().describe("Only observations updated since this ISO timestamp or date."),
+  month: z.string().optional().describe("Observed month number, or comma-separated month numbers."),
+  year: z.string().optional().describe("Observed year, or comma-separated years."),
   quality_grade: z
     .enum(["casual", "needs_id", "research"])
     .optional()
@@ -246,7 +312,7 @@ type TransportMode = "stdio" | "http";
 function createServer(): McpServer {
   const server = new McpServer({
     name: "inaturalist-mcp",
-    version: "1.2.0",
+    version: SERVER_VERSION,
   });
 
   server.registerTool(
@@ -261,11 +327,12 @@ function createServer(): McpServer {
           .describe("Sort field."),
         order: z.enum(["asc", "desc"]).optional().describe("Sort direction."),
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("observations", args));
+        return toolResult(await getJson("observations", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -275,14 +342,21 @@ function createServer(): McpServer {
   server.registerTool(
     "get_observation",
     {
-      description: "Get one public iNaturalist observation by observation ID.",
+      description: "Get one public iNaturalist observation by numeric observation ID or v2 UUID.",
       inputSchema: {
-        id: z.number().int().positive().describe("iNaturalist observation ID."),
+        id: observationIdSchema,
+        ...fieldsSchema,
       },
     },
-    async ({ id }) => {
+    async ({ id, fields }) => {
       try {
-        return toolResult(await getJson(`observations/${id}`));
+        if (typeof id === "string" && isUuid(id)) {
+          return toolResult(await getJson(`observations/${id}`, { fields }, { apiVersion: "v2", defaultFields: true }));
+        }
+
+        return toolResult(
+          await getJson("observations", { id, per_page: 1, fields }, { apiVersion: "v2", defaultFields: true }),
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -301,12 +375,14 @@ function createServer(): McpServer {
           .optional()
           .describe("Comma-separated iconic taxa, e.g. Aves,Mammalia,Plantae."),
         locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
+        preferred_place_id: z.number().int().positive().optional().describe("Place preference for regional common names."),
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("taxa", args));
+        return toolResult(await getJson("taxa", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -320,11 +396,12 @@ function createServer(): McpServer {
       inputSchema: {
         id: z.number().int().positive().describe("iNaturalist taxon ID."),
         locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
+        ...fieldsSchema,
       },
     },
-    async ({ id, locale }) => {
+    async ({ id, locale, fields }) => {
       try {
-        return toolResult(await getJson(`taxa/${id}`, { locale }));
+        return toolResult(await getJson(`taxa/${id}`, { locale, fields }, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -338,11 +415,12 @@ function createServer(): McpServer {
       inputSchema: {
         ...observationFilterSchema,
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("observations/species_counts", args));
+        return toolResult(await getJson("observations/species_counts", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -352,15 +430,18 @@ function createServer(): McpServer {
   server.registerTool(
     "search_places",
     {
-      description: "Autocomplete iNaturalist places by name.",
+      description: "Search iNaturalist places by name using the v2 places endpoint.",
       inputSchema: {
         q: z.string().describe("Place name query, e.g. Shanghai."),
         order_by: z.enum(["area"]).optional().describe("Sort places by area."),
+        geo: z.boolean().optional().describe("Only return places with geometry."),
+        per_page: paginationSchema.per_page,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("places/autocomplete", args));
+        return toolResult(await getJson("places", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -377,11 +458,12 @@ function createServer(): McpServer {
           .string()
           .optional()
           .describe("Optional comma-separated admin levels, e.g. 0,10,20."),
+        ...fieldsSchema,
       },
     },
-    async ({ id, admin_level }) => {
+    async ({ id, admin_level, fields }) => {
       try {
-        return toolResult(await getJson(`places/${id}`, { admin_level }));
+        return toolResult(await getJson(`places/${id}`, { admin_level, fields }, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -409,11 +491,22 @@ function createServer(): McpServer {
           .optional()
           .describe("Sort field."),
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("projects", args));
+        const { featured, ...projectArgs } = args;
+        return toolResult(
+          await getJson(
+            "projects",
+            {
+              ...projectArgs,
+              features: featured,
+            },
+            { apiVersion: "v2", defaultFields: true },
+          ),
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -427,11 +520,12 @@ function createServer(): McpServer {
       inputSchema: {
         id: z.union([z.number().int().positive(), z.string()]).describe("iNaturalist project ID or slug."),
         rule_details: z.boolean().optional().describe("Include project rule details."),
+        ...fieldsSchema,
       },
     },
-    async ({ id, rule_details }) => {
+    async ({ id, rule_details, fields }) => {
       try {
-        return toolResult(await getJson(`projects/${id}`, { rule_details }));
+        return toolResult(await getJson(`projects/${id}`, { rule_details, fields }, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -446,11 +540,12 @@ function createServer(): McpServer {
         q: z.string().describe("Username or name query."),
         project_id: z.string().optional().describe("Limit to users associated with this project ID or slug."),
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("users/autocomplete", args));
+        return toolResult(await getJson("users/autocomplete", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -463,11 +558,12 @@ function createServer(): McpServer {
       description: "Get one iNaturalist user by ID or username.",
       inputSchema: {
         id: z.union([z.number().int().positive(), z.string()]).describe("iNaturalist user ID or username."),
+        ...fieldsSchema,
       },
     },
-    async ({ id }) => {
+    async ({ id, fields }) => {
       try {
-        return toolResult(await getJson(`users/${id}`));
+        return toolResult(await getJson(`users/${id}`, { fields }, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -489,11 +585,12 @@ function createServer(): McpServer {
         locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
         preferred_place_id: z.number().int().positive().optional().describe("Place preference for regional common names."),
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("search", args));
+        return toolResult(await getJson("search", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -508,11 +605,12 @@ function createServer(): McpServer {
         ...observationFilterSchema,
         date_field: z.enum(["observed", "created"]).optional().describe("Date field to histogram."),
         interval: z.enum(["hour", "day", "week", "month", "year"]).optional().describe("Histogram interval."),
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("observations/histogram", args));
+        return toolResult(await getJson("observations/histogram", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -526,11 +624,12 @@ function createServer(): McpServer {
       inputSchema: {
         ...observationFilterSchema,
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("observations/observers", args));
+        return toolResult(await getJson("observations/observers", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -544,11 +643,12 @@ function createServer(): McpServer {
       inputSchema: {
         ...observationFilterSchema,
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("observations/identifiers", args));
+        return toolResult(await getJson("observations/identifiers", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -562,11 +662,12 @@ function createServer(): McpServer {
       inputSchema: {
         ...observationFilterSchema,
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("observations/popular_field_values", args));
+        return toolResult(await getJson("observations/popular_field_values", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -576,7 +677,8 @@ function createServer(): McpServer {
   server.registerTool(
     "search_identifications",
     {
-      description: "Search public iNaturalist identifications by identifier, taxon, observation taxon, place, date, or category.",
+      description:
+        "Search public iNaturalist identifications by identifier, taxon, observation taxon, place, date, or category. Uses the v1 endpoint because v2 does not provide equivalent public search coverage.",
       inputSchema: {
         ...identificationFilterSchema,
         order_by: z.enum(["created_at", "id"]).optional().describe("Sort field."),
@@ -586,7 +688,7 @@ function createServer(): McpServer {
     },
     async (args) => {
       try {
-        return toolResult(await getJson("identifications", args));
+        return toolResult(await getJson("identifications", args, { apiVersion: "v1" }));
       } catch (error) {
         return errorResult(error);
       }
@@ -596,14 +698,14 @@ function createServer(): McpServer {
   server.registerTool(
     "get_identification",
     {
-      description: "Get one or more public iNaturalist identifications by ID.",
+      description: "Get one or more public iNaturalist identifications by ID. Uses v1 because v2 has no public GET-by-ID endpoint.",
       inputSchema: {
         id: z.string().describe("Identification ID, or comma-separated IDs."),
       },
     },
     async ({ id }) => {
       try {
-        return toolResult(await getJson(`identifications/${id}`));
+        return toolResult(await getJson(`identifications/${id}`, {}, { apiVersion: "v1" }));
       } catch (error) {
         return errorResult(error);
       }
@@ -613,7 +715,8 @@ function createServer(): McpServer {
   server.registerTool(
     "get_identification_species_counts",
     {
-      description: "Get species counts from public iNaturalist identifications matching filters.",
+      description:
+        "Get species counts from public iNaturalist identifications matching filters. Uses v1 because v2 has no equivalent endpoint.",
       inputSchema: {
         ...identificationFilterSchema,
         taxon_of: z
@@ -626,7 +729,7 @@ function createServer(): McpServer {
     },
     async (args) => {
       try {
-        return toolResult(await getJson("identifications/species_counts", args));
+        return toolResult(await getJson("identifications/species_counts", args, { apiVersion: "v1" }));
       } catch (error) {
         return errorResult(error);
       }
@@ -636,7 +739,8 @@ function createServer(): McpServer {
   server.registerTool(
     "get_identification_identifiers",
     {
-      description: "Get top identifiers from public iNaturalist identifications matching filters.",
+      description:
+        "Get top identifiers from public iNaturalist identifications matching filters. Uses v1 to preserve the broader filter set.",
       inputSchema: {
         ...identificationFilterSchema,
         ...paginationSchema,
@@ -644,7 +748,7 @@ function createServer(): McpServer {
     },
     async (args) => {
       try {
-        return toolResult(await getJson("identifications/identifiers", args));
+        return toolResult(await getJson("identifications/identifiers", args, { apiVersion: "v1" }));
       } catch (error) {
         return errorResult(error);
       }
@@ -654,7 +758,8 @@ function createServer(): McpServer {
   server.registerTool(
     "get_identification_observers",
     {
-      description: "Get top observers from public iNaturalist identifications matching filters.",
+      description:
+        "Get top observers from public iNaturalist identifications matching filters. Uses v1 because v2 has no equivalent endpoint.",
       inputSchema: {
         ...identificationFilterSchema,
         ...paginationSchema,
@@ -662,7 +767,7 @@ function createServer(): McpServer {
     },
     async (args) => {
       try {
-        return toolResult(await getJson("identifications/observers", args));
+        return toolResult(await getJson("identifications/observers", args, { apiVersion: "v1" }));
       } catch (error) {
         return errorResult(error);
       }
@@ -680,11 +785,12 @@ function createServer(): McpServer {
         swlng: z.number().min(-180).max(180).describe("Southwest longitude."),
         name: z.string().optional().describe("Optional place name filter."),
         per_page: paginationSchema.per_page,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        return toolResult(await getJson("places/nearby", args));
+        return toolResult(await getJson("places/nearby", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -700,11 +806,18 @@ function createServer(): McpServer {
         role: z.enum(["curator", "manager"]).optional().describe("Membership role filter."),
         skip_counts: z.boolean().optional().describe("Skip expensive count fields when supported by the API."),
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
-    async ({ id, role, skip_counts, page, per_page }) => {
+    async ({ id, role, skip_counts, page, per_page, fields }) => {
       try {
-        return toolResult(await getJson(`projects/${id}/members`, { role, skip_counts, page, per_page }));
+        return toolResult(
+          await getJson(
+            `projects/${id}/members`,
+            { role, skip_counts, page, per_page, fields },
+            { apiVersion: "v2", defaultFields: true },
+          ),
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -720,11 +833,18 @@ function createServer(): McpServer {
         rule_details: z.boolean().optional().describe("Include project rule details."),
         project_type: z.enum(["collection", "umbrella"]).optional().describe("Project type filter."),
         ...paginationSchema,
+        ...fieldsSchema,
       },
     },
-    async ({ id, rule_details, project_type, page, per_page }) => {
+    async ({ id, rule_details, project_type, page, per_page, fields }) => {
       try {
-        return toolResult(await getJson(`users/${id}/projects`, { rule_details, project_type, page, per_page }));
+        return toolResult(
+          await getJson(
+            `users/${id}/projects`,
+            { rule_details, project_type, page, per_page, fields },
+            { apiVersion: "v2", defaultFields: true },
+          ),
+        );
       } catch (error) {
         return errorResult(error);
       }
@@ -735,11 +855,13 @@ function createServer(): McpServer {
     "get_controlled_terms",
     {
       description: "Get iNaturalist controlled terms used for annotations.",
-      inputSchema: {},
+      inputSchema: {
+        ...fieldsSchema,
+      },
     },
-    async () => {
+    async (args) => {
       try {
-        return toolResult(await getJson("controlled_terms"));
+        return toolResult(await getJson("controlled_terms", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -752,11 +874,247 @@ function createServer(): McpServer {
       description: "Get annotation controlled terms applicable to a taxon.",
       inputSchema: {
         taxon_id: z.number().int().positive().describe("iNaturalist taxon ID."),
+        ...fieldsSchema,
       },
     },
-    async ({ taxon_id }) => {
+    async ({ taxon_id, fields }) => {
       try {
-        return toolResult(await getJson("controlled_terms/for_taxon", { taxon_id }));
+        return toolResult(
+          await getJson(`controlled_terms/for_taxon/${taxon_id}`, { fields }, { apiVersion: "v2", defaultFields: true }),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_observation_quality_grades",
+    {
+      description: "Get quality-grade counts for public iNaturalist observations matching filters.",
+      inputSchema: {
+        ...observationFilterSchema,
+        ...fieldsSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("observations/quality_grades", args, { apiVersion: "v2", defaultFields: true }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_observation_identification_categories",
+    {
+      description: "Get identification-category counts for public iNaturalist observations matching filters.",
+      inputSchema: {
+        ...observationFilterSchema,
+        ...fieldsSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(
+          await getJson("observations/identification_categories", args, { apiVersion: "v2", defaultFields: true }),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_observation_iconic_taxa_species_counts",
+    {
+      description: "Get species counts grouped by iconic taxon for public iNaturalist observations matching filters.",
+      inputSchema: {
+        ...observationFilterSchema,
+        ...paginationSchema,
+        ...fieldsSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(
+          await getJson("observations/iconic_taxa_species_counts", args, {
+            apiVersion: "v2",
+            defaultFields: COMPACT_TAXON_COUNT_FIELDS,
+          }),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_observation_quality_metrics",
+    {
+      description: "Get data-quality assessment metrics for an iNaturalist observation by numeric ID or v2 UUID.",
+      inputSchema: {
+        id: observationIdSchema,
+        ...fieldsSchema,
+      },
+    },
+    async ({ id, fields }) => {
+      try {
+        const uuid = await resolveObservationUuid(id);
+        return toolResult(
+          await getJson(`observations/${uuid}/quality_metrics`, { fields }, { apiVersion: "v2", defaultFields: true }),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_observation_taxon_summary",
+    {
+      description: "Get additional taxon summary information for an iNaturalist observation by numeric ID or v2 UUID.",
+      inputSchema: {
+        id: observationIdSchema,
+        community: z.boolean().optional().describe("Show information about the community taxon instead of the observation taxon."),
+      },
+    },
+    async ({ id, community }) => {
+      try {
+        const uuid = await resolveObservationUuid(id);
+        return toolResult(await getJson(`observations/${uuid}/taxon_summary`, { community }, { apiVersion: "v2" }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_iconic_taxa",
+    {
+      description: "Get the standard iconic taxa used by iNaturalist, such as Aves, Mammalia, Plantae, and Insecta.",
+      inputSchema: {
+        ...fieldsSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("taxa/iconic", args, { apiVersion: "v2", defaultFields: true }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_taxon_wanted",
+    {
+      description: "Get unobserved or wanted taxa in a clade by iNaturalist taxon ID.",
+      inputSchema: {
+        id: z.number().int().positive().describe("iNaturalist taxon ID for the clade."),
+        ...paginationSchema,
+        fields: fieldsSchema.fields.describe(
+          "iNaturalist API v2 response fields. Defaults to a compact response for this endpoint; use all for full taxon data.",
+        ),
+      },
+    },
+    async ({ id, page, per_page, fields }) => {
+      try {
+        return toolResult(
+          await getJson(`taxa/${id}/wanted`, { page, per_page, fields }, { apiVersion: "v2", defaultFields: false }),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_identification_similar_species",
+    {
+      description: "Get taxa that have appeared as similar or competing identifications for a taxon.",
+      inputSchema: {
+        taxon_id: z.number().int().positive().describe("iNaturalist taxon ID."),
+        quality_grade: z.enum(["casual", "needs_id", "research"]).optional().describe("Observation quality grade."),
+        ...paginationSchema,
+        fields: fieldsSchema.fields.describe("iNaturalist API v2 response fields. Defaults to compact taxon count fields."),
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(
+          await getJson("identifications/similar_species", args, {
+            apiVersion: "v2",
+            defaultFields: COMPACT_TAXON_COUNT_FIELDS,
+          }),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_identification_recent_taxa",
+    {
+      description: "Get taxa from recent identifications within a taxon or clade.",
+      inputSchema: {
+        taxon_id: z.string().describe("Taxon ID, or comma-separated taxon IDs."),
+        quality_grade: z.enum(["casual", "needs_id", "research"]).optional().describe("Observation quality grade."),
+        rank: z.string().optional().describe("Identification taxon rank."),
+        category: z
+          .enum(["improving", "supporting", "leading", "maverick"])
+          .optional()
+          .describe("Identification category."),
+        verifiable: z.boolean().optional().describe("Only observations with needs_id or research quality grade."),
+        locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
+        ...paginationSchema,
+        fields: fieldsSchema.fields.describe("iNaturalist API v2 response fields. Defaults to compact taxon count fields."),
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(
+          await getJson("identifications/recent_taxa", args, {
+            apiVersion: "v2",
+            defaultFields: COMPACT_TAXON_COUNT_FIELDS,
+          }),
+        );
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_sites",
+    {
+      description: "List iNaturalist network sites.",
+      inputSchema: {
+        ...fieldsSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("sites", args, { apiVersion: "v2", defaultFields: true }));
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_translated_locales",
+    {
+      description: "List locales translated by iNaturalist.",
+      inputSchema: {
+        ...fieldsSchema,
+      },
+    },
+    async (args) => {
+      try {
+        return toolResult(await getJson("translations/locales", args, { apiVersion: "v2", defaultFields: true }));
       } catch (error) {
         return errorResult(error);
       }
@@ -777,11 +1135,12 @@ function createServer(): McpServer {
         quality_grade: z.enum(["casual", "needs_id", "research"]).optional().describe("Observation quality grade."),
         locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
         per_page: paginationSchema.per_page,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
-        const speciesCounts = await getJson("observations/species_counts", args);
+        const speciesCounts = await getJson("observations/species_counts", args, { apiVersion: "v2", defaultFields: true });
         return toolResult({
           query: args,
           summary: {
@@ -809,13 +1168,14 @@ function createServer(): McpServer {
         quality_grade: z.enum(["casual", "needs_id", "research"]).optional().describe("Observation quality grade."),
         locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
         per_page: paginationSchema.per_page,
+        ...fieldsSchema,
       },
     },
     async (args) => {
       try {
         const [observations, speciesCounts] = await Promise.all([
-          getJson("observations", { ...args, per_page: 1 }),
-          getJson("observations/species_counts", args),
+          getJson("observations", { ...args, per_page: 1 }, { apiVersion: "v2", defaultFields: true }),
+          getJson("observations/species_counts", args, { apiVersion: "v2", defaultFields: true }),
         ]);
         const topSpecies = summarizeSpeciesCounts(speciesCounts);
 
@@ -858,11 +1218,12 @@ function createServer(): McpServer {
         order: z.enum(["asc", "desc"]).optional().describe("Observation sort direction."),
         locale: z.string().optional().describe("Locale for common names, e.g. en, zh-CN."),
         per_page: paginationSchema.per_page,
+        ...fieldsSchema,
       },
     },
     async ({ q, ...observationArgs }) => {
       try {
-        const places = await getJson("places/autocomplete", { q, per_page: 1 });
+        const places = await getJson("places", { q, per_page: 1, fields: "all" }, { apiVersion: "v2" });
         const selectedPlace = resultsOf(places)[0];
         const selectedPlaceRecord = asRecord(selectedPlace);
 
@@ -881,7 +1242,7 @@ function createServer(): McpServer {
         const observations = await getJson("observations", {
           ...observationArgs,
           place_id: String(selectedPlaceRecord.id),
-        });
+        }, { apiVersion: "v2", defaultFields: true });
 
         return toolResult({
           place_query: q,
